@@ -135,6 +135,20 @@ ulong notrace get_tbclk(void)
 }
 
 /*
+ * Short settle delay used while the CPU is parked on the reference PLL.
+ * The counter is volatile so the compiler cannot drop the loop: the vendor
+ * sequence leaves about 4096 iterations between each clock switch and the
+ * PLL register access, and without a real delay the switch has not settled.
+ */
+static void mt7621_pll_settle(void)
+{
+	volatile int i;
+
+	for (i = 0; i < 4096; i++)
+		;
+}
+
+/*
  * Retune the MT7621 CPU clock at run time.
  *
  * MT7621 derives the CPU clock from MEMPLL (DRAMC MEMPLL18), the same PLL
@@ -158,7 +172,6 @@ int mt7621_set_cpu_freq(u32 mhz)
 	void __iomem *dramc_base = (void __iomem *)CKSEG1ADDR(MT7621_DRAMC_BASE);
 	const static u8 xtal_div_tbl[] = { 0, 1, 2, 2 };
 	u32 xtal_hz = 0, xtal_mhz, prediv, fbdiv, num, v, clk;
-	int i;
 
 	mt7621_get_clocks(NULL, NULL, NULL, &xtal_hz);
 	xtal_mhz = xtal_hz / 1000000;
@@ -179,8 +192,7 @@ int mt7621_set_cpu_freq(u32 mhz)
 	/* Park the CPU on the fixed reference PLL while MEMPLL is retuned */
 	clk = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
 	writel(clk & ~(0x3u << 30), sys_base + MT7621_SYS_CLKCFG0_REG);
-	for (i = 0; i < 4096; i++)
-		;
+	mt7621_pll_settle();
 
 	writel(0x101, sys_base + 0x410);
 
@@ -190,14 +202,12 @@ int mt7621_set_cpu_freq(u32 mhz)
 	       (1u << RG_MEPL_LF_S));
 	v |= (fbdiv << RG_MEPL_FBDIV_S) | (prediv << RG_MEPL_PREDIV_S);
 	writel(v, dramc_base + MT7621_DRAMC_MEMPLL18_REG);
-	for (i = 0; i < 4096; i++)
-		;
+	mt7621_pll_settle();
 
 	clk = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
 	writel((clk & ~(0x3u << 30)) | (1u << 30),
 	       sys_base + MT7621_SYS_CLKCFG0_REG);
-	for (i = 0; i < 4096; i++)
-		;
+	mt7621_pll_settle();
 
 	gd->cpu_clk = 0;
 	clk = (u32)get_cpu_freq(0);
