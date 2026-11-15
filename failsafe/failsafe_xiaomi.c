@@ -690,14 +690,19 @@ static int oc_read_saved(unsigned *mhz)
  */
 static int oc_store_saved(unsigned mhz)
 {
+	struct mtd_info *mtd;
 	void *flash;
 	uint64_t off, size;
 	struct oc_record r, back;
-	uint32_t erase;
+	uint8_t *buf;
+	uint32_t erase, page;
+	int ret;
 
 	flash = mtk_board_get_flash_dev();
 	if (!flash)
 		return -ENODEV;
+
+	mtd = (struct mtd_info *)flash;
 
 	if (get_mtd_part_info(OC_PART, &off, &size) || size < sizeof(r))
 		return -ENOENT;
@@ -706,15 +711,33 @@ static int oc_store_saved(unsigned mhz)
 	if (!erase || erase > size)
 		return -EINVAL;
 
+	/*
+	 * SPI NAND can only be programmed a whole page at a time, so the record
+	 * is written inside a page-sized buffer padded with 0xff.
+	 */
+	page = mtd->writesize;
+	if (!page || page > 8192 || page < sizeof(r))
+		return -EINVAL;
+
+	buf = malloc(page);
+	if (!buf)
+		return -ENOMEM;
+
 	r.magic = OC_REC_MAGIC;
 	r.version = OC_REC_VERSION;
 	r.mhz = mhz;
 	r.crc = crc32(0, (const unsigned char *)&r, 12);
 
-	if (mtk_board_flash_erase(flash, off, erase))
+	memset(buf, 0xff, page);
+	memcpy(buf, &r, sizeof(r));
+
+	ret = mtk_board_flash_erase(flash, off, erase);
+	if (!ret)
+		ret = mtk_board_flash_write(flash, off, page, buf);
+	free(buf);
+	if (ret)
 		return -EIO;
-	if (mtk_board_flash_write(flash, off, sizeof(r), &r))
-		return -EIO;
+
 	if (mtk_board_flash_read(flash, off, sizeof(back), &back))
 		return -EIO;
 	if (memcmp(&r, &back, sizeof(r)))
