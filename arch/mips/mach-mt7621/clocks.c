@@ -133,3 +133,74 @@ ulong notrace get_tbclk(void)
 {
 	return get_cpu_freq(0) / 2;
 }
+
+/*
+ * Retune the MT7621 CPU clock at run time.
+ *
+ * MT7621 derives the CPU clock from MEMPLL (DRAMC MEMPLL18), the same PLL
+ * domain the DRAM controller uses, so it cannot be reprogrammed while the
+ * CPU is clocked from it.  The sequence used here is the one validated on
+ * the AC2100 build of this bootloader:
+ *
+ *   1. clear CPU_CLK_SEL so the CPU runs from the fixed 500 MHz reference,
+ *   2. touch SYSCTL 0x410 (reference clock gate used by the vendor DRAM init),
+ *   3. rewrite RG_MEPL_PREDIV / RG_MEPL_FBDIV in MEMPLL18, keeping every
+ *      other bit (enable, VOD, loop filter) untouched,
+ *   4. set CPU_CLK_SEL again so the CPU runs from the retuned MEMPLL,
+ *   5. verify the result against get_cpu_freq().
+ *
+ * Only frequencies that map to an integer FBDIV for the board's crystal are
+ * accepted; anything else returns -EINVAL before a register is touched.
+ */
+int mt7621_set_cpu_freq(u32 mhz)
+{
+	void __iomem *sys_base = (void __iomem *)CKSEG1ADDR(MT7621_SYSCTL_BASE);
+	void __iomem *dramc_base = (void __iomem *)CKSEG1ADDR(MT7621_DRAMC_BASE);
+	const static u8 xtal_div_tbl[] = { 0, 1, 2, 2 };
+	u32 xtal_hz = 0, xtal_mhz, prediv, fbdiv, num, v, clk;
+	int i;
+
+	mt7621_get_clocks(NULL, NULL, NULL, &xtal_hz);
+	xtal_mhz = xtal_hz / 1000000;
+	if (!xtal_mhz || xtal_mhz > 100)
+		return -EINVAL;
+
+	v = readl(dramc_base + MT7621_DRAMC_MEMPLL18_REG);
+	prediv = REG_GET_VAL(RG_MEPL_PREDIV, v);
+
+	num = mhz << xtal_div_tbl[prediv];
+	if (num % xtal_mhz)
+		return -EINVAL;
+
+	fbdiv = num / xtal_mhz - 1;
+	if (fbdiv >= (RG_MEPL_FBDIV_M + 1))
+		return -EINVAL;
+
+	/* Park the CPU on the fixed reference PLL while MEMPLL is retuned */
+	clk = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
+	writel(clk & ~(0x3u << 30), sys_base + MT7621_SYS_CLKCFG0_REG);
+	for (i = 0; i < 4096; i++)
+		;
+
+	writel(0x101, sys_base + 0x410);
+
+	v = readl(dramc_base + MT7621_DRAMC_MEMPLL18_REG);
+	v &= ~((RG_MEPL_FBDIV_M << RG_MEPL_FBDIV_S) |
+	       (RG_MEPL_PREDIV_M << RG_MEPL_PREDIV_S) |
+	       (1u << RG_MEPL_LF_S));
+	v |= (fbdiv << RG_MEPL_FBDIV_S) | (prediv << RG_MEPL_PREDIV_S);
+	writel(v, dramc_base + MT7621_DRAMC_MEMPLL18_REG);
+	for (i = 0; i < 4096; i++)
+		;
+
+	clk = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
+	writel((clk & ~(0x3u << 30)) | (1u << 30),
+	       sys_base + MT7621_SYS_CLKCFG0_REG);
+	for (i = 0; i < 4096; i++)
+		;
+
+	gd->cpu_clk = 0;
+	clk = (u32)get_cpu_freq(0);
+
+	return (clk / 1000000 == mhz) ? 0 : -EIO;
+}

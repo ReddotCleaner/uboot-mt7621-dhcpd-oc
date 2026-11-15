@@ -54,17 +54,30 @@ DECLARE_GLOBAL_DATA_PTR;
 #define FS_COLOR_NORMAL	"\x1b[0m"
 
 /*
- * Environment variables carrying the overclock setting from the failsafe Web
- * UI to the next operating system boot.  The value is consumed by
- * xiaomi_apply_saved_cpu_freq() just before control is handed to the kernel.
+ * The overclock setting travels from the failsafe Web UI to the next OS boot
+ * through a small record at the start of the 'u-boot-env' partition.
+ *
+ * This build has no environment backend (the environment lives in RAM only),
+ * so env_set() from the Web UI would be forgotten on the next reset.  The
+ * 'u-boot-env' area is never written by this bootloader, so a 16-byte record
+ * there cannot collide with anything.
  */
 #define ENV_OC_ENABLED		"failsafe_oc_enabled"
 #define ENV_OC_MHZ		"failsafe_oc_mhz"
 
-/* Frequency bounds accepted by the Web UI and by the apply step. */
-#define OC_MIN_MHZ		400
-#define OC_MAX_MHZ		1000
-#define OC_STEP_MHZ		5
+#define OC_PART			"u-boot-env"
+#define OC_REC_MAGIC		0x4d544f43	/* "MTOC" */
+#define OC_REC_VERSION		1
+
+/*
+ * Frequency bounds accepted by the Web UI and by the apply step: 880 MHz is
+ * the stock rate, 1200 MHz is the highest value verified on this SoC, and
+ * MEMPLL moves in 20 MHz steps for the board's 40 MHz crystal, so anything
+ * that is not a multiple of 20 can never be programmed exactly.
+ */
+#define OC_MIN_MHZ		880
+#define OC_MAX_MHZ		1200
+#define OC_STEP_MHZ		20
 
 /*
  * Offsets of the four interface MAC fields inside Xiaomi's Factory partition.
@@ -629,6 +642,87 @@ static unsigned oc_current_mhz(void)
 	return mhz ? mhz : oc_safe_mhz();
 }
 
+struct oc_record {
+	u32 magic;
+	u32 version;
+	u32 mhz;
+	u32 crc;
+};
+
+/*
+ * Read the stored frequency.  A missing record, a bad magic, a CRC mismatch
+ * or an out-of-range value all mean "boot at the safe frequency"; nothing is
+ * trusted unless every check passes.
+ */
+static int oc_read_saved(unsigned *mhz)
+{
+	void *flash;
+	uint64_t off, size;
+	struct oc_record r;
+
+	flash = mtk_board_get_flash_dev();
+	if (!flash)
+		return -ENODEV;
+
+	if (get_mtd_part_info(OC_PART, &off, &size) || size < sizeof(r))
+		return -ENOENT;
+
+	if (mtk_board_flash_read(flash, off, sizeof(r), &r))
+		return -EIO;
+
+	if (r.magic != OC_REC_MAGIC || r.version != OC_REC_VERSION)
+		return -ENOENT;
+
+	if (r.crc != crc32(0, (const unsigned char *)&r, 12))
+		return -EBADMSG;
+
+	if (!oc_is_valid_mhz(r.mhz))
+		return -EINVAL;
+
+	*mhz = r.mhz;
+	return 0;
+}
+
+/*
+ * Persist the frequency, then read it back.  The whole erase block is
+ * rewritten so a torn write leaves either the old record (if the erase did
+ * not complete) or an invalid CRC (if it did), never a half-valid one.
+ */
+static int oc_store_saved(unsigned mhz)
+{
+	void *flash;
+	uint64_t off, size;
+	struct oc_record r, back;
+	uint32_t erase;
+
+	flash = mtk_board_get_flash_dev();
+	if (!flash)
+		return -ENODEV;
+
+	if (get_mtd_part_info(OC_PART, &off, &size) || size < sizeof(r))
+		return -ENOENT;
+
+	erase = mtk_board_get_flash_erase_size(flash);
+	if (!erase || erase > size)
+		return -EINVAL;
+
+	r.magic = OC_REC_MAGIC;
+	r.version = OC_REC_VERSION;
+	r.mhz = mhz;
+	r.crc = crc32(0, (const unsigned char *)&r, 12);
+
+	if (mtk_board_flash_erase(flash, off, erase))
+		return -EIO;
+	if (mtk_board_flash_write(flash, off, sizeof(r), &r))
+		return -EIO;
+	if (mtk_board_flash_read(flash, off, sizeof(back), &back))
+		return -EIO;
+	if (memcmp(&r, &back, sizeof(r)))
+		return -EIO;
+
+	return 0;
+}
+
 static void oc_build_json(char *buf, size_t buf_sz, bool ok, int error,
 			  bool enabled, unsigned configured_mhz,
 			  unsigned current_mhz)
@@ -664,29 +758,28 @@ void cpufreq_handler(enum httpd_uri_handler_status status,
 		     struct httpd_response *response)
 {
 	char json[512];
-	const char *saved_enabled, *saved_mhz;
+	unsigned saved = 0;
 	bool enabled = false;
 	unsigned configured = 0, current;
 	struct httpd_form_value *action, *mhz_val;
-	int error = 0;
+	int error = 0, ret;
 
 	if (status != HTTP_CB_NEW)
 		return;
 
-	saved_enabled = env_get(ENV_OC_ENABLED);
-	saved_mhz = env_get(ENV_OC_MHZ);
-
-	if (saved_enabled && !strcmp(saved_enabled, "1")) {
-		unsigned v = saved_mhz ? simple_strtoul(saved_mhz, NULL, 10) : 0;
-
-		if (oc_is_valid_mhz(v)) {
-			enabled = true;
-			configured = v;
-		} else {
-			printf("\n" FS_COLOR_ERROR "*** Stored CPU frequency "
-			       "is out of range; using safe frequency ***"
-			       FS_COLOR_NORMAL "\n");
-		}
+	ret = oc_read_saved(&saved);
+	if (!ret) {
+		configured = saved;
+		enabled = (saved != oc_safe_mhz());
+	} else if (ret != -ENOENT) {
+		/*
+		 * A corrupt or out-of-range record is dropped here so the boot
+		 * path does not keep tripping over it.
+		 */
+		printf("\n" FS_COLOR_ERROR "*** Stored CPU frequency is "
+		       "invalid; using safe frequency ***"
+		       FS_COLOR_NORMAL "\n");
+		oc_store_saved(oc_safe_mhz());
 	}
 
 	current = oc_current_mhz();
@@ -707,15 +800,20 @@ void cpufreq_handler(enum httpd_uri_handler_status status,
 	}
 
 	if (!strcmp(action->data, "disable")) {
-		env_set(ENV_OC_ENABLED, "0");
-		env_set(ENV_OC_MHZ, "0");
+		error = oc_store_saved(oc_safe_mhz());
+		if (error) {
+			oc_build_json(json, sizeof(json), false, error, enabled,
+				      configured, current);
+			oc_respond(response, json);
+			return;
+		}
 		printf("\n" FS_COLOR_PROMPT "*** CPU overclock disabled; safe "
-		       "frequency will be used ***" FS_COLOR_NORMAL "\n");
+		       "frequency will be used on the next boot ***"
+		       FS_COLOR_NORMAL "\n");
 		enabled = false;
-		configured = 0;
+		configured = oc_safe_mhz();
 	} else if (!strcmp(action->data, "set")) {
 		unsigned mhz;
-		char mhz_str[16];
 
 		mhz_val = httpd_request_find_value(request, "mhz");
 		if (!mhz_val) {
@@ -736,14 +834,22 @@ void cpufreq_handler(enum httpd_uri_handler_status status,
 			return;
 		}
 
-		snprintf(mhz_str, sizeof(mhz_str), "%u", mhz);
-		env_set(ENV_OC_ENABLED, "1");
-		env_set(ENV_OC_MHZ, mhz_str);
+		error = oc_store_saved(mhz);
+		if (error) {
+			printf("\n" FS_COLOR_ERROR "*** Unable to store the CPU "
+			       "frequency (%d) ***" FS_COLOR_NORMAL "\n",
+			       error);
+			oc_build_json(json, sizeof(json), false, error, enabled,
+				      configured, current);
+			oc_respond(response, json);
+			return;
+		}
 
-		printf("\n" FS_COLOR_PROMPT "*** Saved delayed CPU frequency: "
-		       "%u MHz ***" FS_COLOR_NORMAL "\n", mhz);
+		printf("\n" FS_COLOR_PROMPT "*** Saved CPU frequency: %u MHz "
+		       "(applied on the next boot) ***"
+		       FS_COLOR_NORMAL "\n", mhz);
 
-		enabled = true;
+		enabled = (mhz != oc_safe_mhz());
 		configured = mhz;
 	} else {
 		oc_build_json(json, sizeof(json), false, -EINVAL, enabled,
@@ -1606,43 +1712,43 @@ int write_xiaomi_stock_failsafe(size_t data_addr, uint32_t data_size)
 
 #ifdef CONFIG_MACH_MT7621
 /*
- * Apply a frequency requested by the failsafe Web UI.
+ * Apply the frequency stored by the failsafe Web UI.
  *
- * U-Boot cannot retune the MT7621 CPU PLL while it is executing from DRAM
- * (the DDR controller shares the MEMPLL domain), so the setting is recorded
- * in the environment and honoured on the next boot through the legacy DRAM
- * init path, which patches RG_MEPL_FBDIV before DRAM comes up.  This hook
- * reports what will be used and validates the stored value.
+ * The value is read from the record in the 'u-boot-env' partition (see
+ * oc_read_saved()) and programmed through mt7621_set_cpu_freq(), which moves
+ * the CPU off the memory PLL, retunes it and switches back.  Only a record
+ * that passes the magic/CRC/range checks is ever acted on, and a failure to
+ * reach the requested rate reverts to the compiled-in safe frequency on the
+ * spot, so the kernel never boots on a half-programmed PLL.
  */
 void xiaomi_apply_saved_cpu_freq(void)
 {
-	const char *en = env_get(ENV_OC_ENABLED);
-	const char *mhz = env_get(ENV_OC_MHZ);
 	unsigned target;
+	int ret;
 
-	if (!en || strcmp(en, "1") || !mhz)
+	if (oc_read_saved(&target))
 		return;
-
-	target = simple_strtoul(mhz, NULL, 10);
-
-	if (!oc_is_valid_mhz(target)) {
-		printf("\n" FS_COLOR_ERROR "*** CPU overclock rejected; booting "
-		       "at safe frequency ***" FS_COLOR_NORMAL "\n");
-		env_set(ENV_OC_ENABLED, "0");
-		env_set(ENV_OC_MHZ, "0");
-		return;
-	}
 
 	if (target == oc_safe_mhz()) {
 		printf("\n" FS_COLOR_PROMPT "*** CPU overclock disabled; safe "
 		       "frequency will be used ***" FS_COLOR_NORMAL "\n");
-		env_set(ENV_OC_ENABLED, "0");
-		env_set(ENV_OC_MHZ, "0");
 		return;
 	}
 
-	printf("\n" FS_COLOR_PROMPT "*** Applying delayed CPU overclock: %u MHz "
-	       "***" FS_COLOR_NORMAL "\n", target);
+	printf("\n" FS_COLOR_PROMPT "*** Applying CPU overclock: %u MHz ***"
+	       FS_COLOR_NORMAL "\n", target);
+
+	ret = mt7621_set_cpu_freq(target);
+	if (ret) {
+		printf("\n" FS_COLOR_ERROR "*** CPU overclock to %u MHz failed "
+		       "(%d); reverting to the safe frequency ***"
+		       FS_COLOR_NORMAL "\n", target, ret);
+		mt7621_set_cpu_freq(oc_safe_mhz());
+		return;
+	}
+
+	printf("\n" FS_COLOR_PROMPT "*** CPU now running at %lu MHz ***"
+	       FS_COLOR_NORMAL "\n", get_cpu_freq(0) / 1000000);
 }
 #else
 void xiaomi_apply_saved_cpu_freq(void)

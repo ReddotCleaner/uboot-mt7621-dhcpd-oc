@@ -9,6 +9,10 @@
 #include <asm-generic/gpio.h>
 #include <led.h>
 
+#ifdef CONFIG_WEBUI_FAILSAFE
+extern void xiaomi_apply_saved_cpu_freq(void);
+#endif
+
 #if defined(CONFIG_BOARD_MT7621_NAND_TEMPLATE) || \
 	defined(CONFIG_BOARD_MT7621_NOR_TEMPLATE)
 #define MT7621_USE_GPIO_LED
@@ -208,6 +212,16 @@ static int do_mtkautoboot(cmd_tbl_t *cmdtp, int flag, int argc,
 		if (delay == 0)
 			delay = 1;
 	}
+
+	/*
+	 * A saved overclock is applied only here, on the normal boot path.
+	 * The web failsafe and TFTP recovery branches above always run at the
+	 * compiled-in safe frequency, so a setting that turns out to be
+	 * unstable can still be cleared from the recovery page.
+	 */
+#ifdef CONFIG_WEBUI_FAILSAFE
+	xiaomi_apply_saved_cpu_freq();
+#endif
 
 	snprintf(cmd, sizeof(cmd), "bootmenu %u", delay);
 	run_command(cmd, 0);
