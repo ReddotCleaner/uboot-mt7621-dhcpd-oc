@@ -55,17 +55,19 @@ DECLARE_GLOBAL_DATA_PTR;
 
 /*
  * The overclock setting travels from the failsafe Web UI to the next OS boot
- * through a small record at the start of the 'u-boot-env' partition.
+ * through a small record stored in the (unused) 'reserved0' partition.
  *
- * This build has no environment backend (the environment lives in RAM only),
- * so env_set() from the Web UI would be forgotten on the next reset.  The
- * 'u-boot-env' area is never written by this bootloader, so a 16-byte record
- * there cannot collide with anything.
+ * It deliberately does NOT live in 'u-boot-env'/'Config': that area holds the
+ * Xiaomi stock environment that the "Stock environment (Config)" editor on the
+ * params page reads and rewrites, and a record at offset 0 breaks that
+ * editor's header/CRC check (the page then reports a save failure).
+ * 'reserved0' is blank on these boards and is never written by the bootloader,
+ * the stock restore path or the params editor.
  */
 #define ENV_OC_ENABLED		"failsafe_oc_enabled"
 #define ENV_OC_MHZ		"failsafe_oc_mhz"
 
-#define OC_PART			"u-boot-env"
+#define OC_PART			"reserved0"
 #define OC_REC_MAGIC		0x4d544f43	/* "MTOC" */
 #define OC_REC_VERSION		1
 
