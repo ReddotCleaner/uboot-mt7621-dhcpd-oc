@@ -171,15 +171,15 @@ int mt7621_set_cpu_freq(u32 mhz)
 	void __iomem *sys_base = (void __iomem *)CKSEG1ADDR(MT7621_SYSCTL_BASE);
 	void __iomem *dramc_base = (void __iomem *)CKSEG1ADDR(MT7621_DRAMC_BASE);
 	const static u8 xtal_div_tbl[] = { 0, 1, 2, 2 };
-	u32 xtal_hz = 0, xtal_mhz, prediv, fbdiv, num, v, clk;
+	u32 xtal_hz = 0, xtal_mhz, prediv, fbdiv, num, orig, v, clk, clk_orig;
 
 	mt7621_get_clocks(NULL, NULL, NULL, &xtal_hz);
 	xtal_mhz = xtal_hz / 1000000;
 	if (!xtal_mhz || xtal_mhz > 100)
 		return -EINVAL;
 
-	v = readl(dramc_base + MT7621_DRAMC_MEMPLL18_REG);
-	prediv = REG_GET_VAL(RG_MEPL_PREDIV, v);
+	orig = readl(dramc_base + MT7621_DRAMC_MEMPLL18_REG);
+	prediv = REG_GET_VAL(RG_MEPL_PREDIV, orig);
 
 	num = mhz << xtal_div_tbl[prediv];
 	if (num % xtal_mhz)
@@ -189,28 +189,46 @@ int mt7621_set_cpu_freq(u32 mhz)
 	if (fbdiv >= (RG_MEPL_FBDIV_M + 1))
 		return -EINVAL;
 
+	/*
+	 * Only RG_MEPL_FBDIV is replaced.  LF, PREDIV, POSDIV, the enable bits
+	 * and the VOD settings stay exactly as the vendor DRAM init left them:
+	 * clearing LF (as an earlier attempt did) changes the loop filter and
+	 * leaves the PLL unstable once the divider is raised.
+	 */
+	v = (orig & ~(RG_MEPL_FBDIV_M << RG_MEPL_FBDIV_S)) |
+	    (fbdiv << RG_MEPL_FBDIV_S);
+
 	/* Park the CPU on the fixed reference PLL while MEMPLL is retuned */
-	clk = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
-	writel(clk & ~(0x3u << 30), sys_base + MT7621_SYS_CLKCFG0_REG);
+	clk_orig = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
+	clk = clk_orig & ~(0x3u << 30);
+	writel(clk, sys_base + MT7621_SYS_CLKCFG0_REG);
+	mt7621_pll_settle();
+
+	/* Same source selection the boot-time DRAM init uses: MPLL from CR */
+	writel(clk | (1u << MPLL_CFG_SEL_S), sys_base + MT7621_SYS_CLKCFG0_REG);
 	mt7621_pll_settle();
 
 	writel(0x101, sys_base + 0x410);
 
-	v = readl(dramc_base + MT7621_DRAMC_MEMPLL18_REG);
-	v &= ~((RG_MEPL_FBDIV_M << RG_MEPL_FBDIV_S) |
-	       (RG_MEPL_PREDIV_M << RG_MEPL_PREDIV_S) |
-	       (1u << RG_MEPL_LF_S));
-	v |= (fbdiv << RG_MEPL_FBDIV_S) | (prediv << RG_MEPL_PREDIV_S);
 	writel(v, dramc_base + MT7621_DRAMC_MEMPLL18_REG);
 	mt7621_pll_settle();
 
-	clk = readl(sys_base + MT7621_SYS_CLKCFG0_REG);
-	writel((clk & ~(0x3u << 30)) | (1u << 30),
-	       sys_base + MT7621_SYS_CLKCFG0_REG);
+	writel(clk | (1u << 30), sys_base + MT7621_SYS_CLKCFG0_REG);
 	mt7621_pll_settle();
 
 	gd->cpu_clk = 0;
 	clk = (u32)get_cpu_freq(0);
 
-	return (clk / 1000000 == mhz) ? 0 : -EIO;
+	if (clk / 1000000 == mhz)
+		return 0;
+
+	/* Put everything back and report the failure to the caller */
+	writel(orig, dramc_base + MT7621_DRAMC_MEMPLL18_REG);
+	mt7621_pll_settle();
+	writel(clk_orig, sys_base + MT7621_SYS_CLKCFG0_REG);
+	mt7621_pll_settle();
+	gd->cpu_clk = 0;
+	get_cpu_freq(0);
+
+	return -EIO;
 }
